@@ -1,215 +1,17 @@
-"""Classes and functions for reading and writing data.
+"""functions for reading and writing data.
 
 """
 
-import pathlib
-import pickle
 import warnings
+
 from os import listdir, path
-from shutil import rmtree
+from typing import Union, List, Optional
 
 import mat73
 import numpy as np
 import scipy.io
-from tqdm import tqdm
+
 from osl_dynamics.data import spm
-
-
-class RW:
-    """Class for reading/writing data.
-
-    Parameters
-    ----------
-    inputs : list of str or str
-        Filenames to be read.
-    data_field : str
-        If a MATLAB filename is passed, this is the field that corresponds to the
-        data. By default we read the field 'X'.
-    sampling_frequency : float
-        Sampling frequency of the data in Hz.
-    store_dir : str
-        Directory to save results and intermediate steps to. Default is /tmp.
-    time_axis_first : bool
-        Is the input data of shape (n_samples, n_channels)?
-    load_memmaps: bool
-        Should we load the data into the memmaps?
-    keep_memmaps_on_close : bool
-        Should we keep the memmaps?
-    """
-
-    def __init__(
-        self,
-        inputs,
-        data_field,
-        sampling_frequency,
-        store_dir,
-        time_axis_first,
-        load_memmaps=True,
-        keep_memmaps_on_close=False,
-    ):
-        self.keep_memmaps_on_close = keep_memmaps_on_close
-        self.load_memmaps = load_memmaps
-
-        # Validate inputs
-        if isinstance(inputs, str):
-            if path.isdir(inputs):
-                self.inputs = list_dir(inputs, keep_ext=[".npy", ".mat", ".txt"])
-            else:
-                self.inputs = [inputs]
-
-        elif isinstance(inputs, np.ndarray):
-            if inputs.ndim == 1:
-                self.inputs = [inputs[:, np.newaxis]]
-            elif inputs.ndim == 2:
-                self.inputs = [inputs]
-            else:
-                self.inputs = inputs
-
-        elif isinstance(inputs, list):
-            if len(inputs) == 0:
-                raise ValueError("Empty list passed.")
-            elif isinstance(inputs[0], str):
-                self.inputs = []
-                for inp in inputs:
-                    if path.isdir(inp):
-                        self.inputs += list_dir(inp, keep_ext=[".npy", ".mat", ".txt"])
-                    else:
-                        self.inputs.append(inp)
-            else:
-                self.inputs = inputs
-
-        else:
-            raise ValueError("inputs must be str, np.ndarray or list.")
-
-        if len(self.inputs) == 0:
-            raise ValueError("No valid inputs were passed.")
-
-        # Directory to store memory maps created by this class
-        self.store_dir = pathlib.Path(store_dir)
-        self.store_dir.mkdir(parents=True, exist_ok=True)
-
-        # Load and validate the raw data
-        self.raw_data_memmaps, self.raw_data_filenames = self.load_raw_data(
-            data_field, time_axis_first
-        )
-        self.validate_data()
-
-        # Get data prepration attributes if the raw data has been prepared
-        if not isinstance(inputs, list):
-            self.load_preparation(inputs)
-
-        # Attributes describing the raw data
-        self.n_raw_data_channels = self.raw_data_memmaps[0].shape[-1]
-        self.sampling_frequency = sampling_frequency
-
-        # Use raw data for the subject data
-        self.subjects = self.raw_data_memmaps
-
-    def delete_dir(self):
-        """Deletes store_dir."""
-        if self.store_dir.exists():
-            rmtree(self.store_dir)
-
-    def load_preparation(self, inputs):
-        """Loads a pickle file containing preparation settings.
-
-        Parameters
-        ----------
-        inputs : str
-            Path to directory containing the pickle file with preparation settings.
-        """
-        if path.isdir(inputs):
-            for file in list_dir(inputs):
-                if "preparation.pkl" in file:
-                    preparation = pickle.load(open(inputs + "/preparation.pkl", "rb"))
-                    self.amplitude_envelope = preparation["amplitude_envelope"]
-                    self.n_window = preparation["n_window"]
-                    self.n_embeddings = preparation["n_embeddings"]
-                    self.n_te_channels = preparation["n_te_channels"]
-                    self.n_pca_components = preparation["n_pca_components"]
-                    self.pca_components = preparation["pca_components"]
-                    self.whiten = preparation["whiten"]
-                    self.prepared = True
-
-    def load_raw_data(
-        self,
-        data_field,
-        time_axis_first,
-    ):
-        """Import data into a list of memory maps.
-
-        Parameters
-        ----------
-        data_field : str
-            If a MATLAB filename is passed, this is the field that corresponds
-            to the data. By default we read the field 'X'.
-        time_axis_first : bool
-            Is the input data of shape (n_samples, n_channels)?
-
-        Returns
-        -------
-        list
-            list of np.memmap.
-        """
-        raw_data_pattern = "raw_data_{{i:0{width}d}}_{identifier}.npy".format(
-            width=len(str(len(self.inputs))), identifier=self._identifier
-        )
-        raw_data_filenames = [
-            str(self.store_dir / raw_data_pattern.format(i=i))
-            for i in range(len(self.inputs))
-        ]
-        # self.raw_data_filenames is not used if self.inputs is a list of strings,
-        # where the strings are paths to .npy files
-
-        memmaps = []
-        for raw_data, mmap_location in zip(
-            tqdm(self.inputs, desc="Loading files", ncols=98), raw_data_filenames
-        ):
-            if not self.load_memmaps:  # do not load into the memory maps
-                mmap_location = None
-            raw_data_mmap = load_data(
-                raw_data, data_field, mmap_location, mmap_mode="r"
-            )
-            if not time_axis_first:
-                raw_data_mmap = raw_data_mmap.T
-            memmaps.append(raw_data_mmap)
-
-        return memmaps, raw_data_filenames
-
-    def save(self, output_dir="."):
-        """Saves data to numpy files.
-
-        Parameters
-        ----------
-        output_dir : str
-            Path to save data files to. Default is the current working
-            directory.
-        """
-        output_dir = pathlib.Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Save time series data
-        for i in tqdm(range(self.n_subjects), desc="Saving data", ncols=98):
-            np.save(f"{output_dir}/subject{i}.npy", self.subjects[i])
-
-        # Save preparation info if .prepared has been called
-        if self.prepared:
-            preparation = {
-                "amplitude_envelope": self.amplitude_envelope,
-                "n_window": self.n_window,
-                "n_embeddings": self.n_embeddings,
-                "n_te_channels": self.n_te_channels,
-                "n_pca_components": self.n_pca_components,
-                "pca_components": self.pca_components,
-                "whiten": self.whiten,
-            }
-            pickle.dump(preparation, open(f"{output_dir}/preparation.pkl", "wb"))
-
-    def validate_data(self):
-        """Validate data files."""
-        n_channels = [memmap.shape[-1] for memmap in self.raw_data_memmaps]
-        if not np.equal(n_channels, n_channels[0]).all():
-            raise ValueError("All inputs should have the same number of channels.")
 
 
 def file_ext(filename):
@@ -226,7 +28,7 @@ def file_ext(filename):
     return ext
 
 
-def list_dir(path, keep_ext=None):
+def list_dir(path: str, keep_ext: Optional[str, List[str]] = None) -> List[str]:
     """Lists a directory.
 
     Parameters
@@ -253,6 +55,48 @@ def list_dir(path, keep_ext=None):
             if file_ext(file) in keep_ext:
                 files.append(path + "/" + file)
     return files
+
+
+def parse_and_validate_inputs(user_inputs: Union[str, np.ndarray, List[str]]):
+    """
+    :param user_inputs: str or np.ndarray or list of strings
+    :return: ?
+    """
+    # Validate inputs
+    if isinstance(user_inputs, str):
+        if path.isdir(user_inputs):
+            inputs = list_dir(user_inputs, keep_ext=[".npy", ".mat", ".txt"])
+        else:
+            inputs = [user_inputs]
+
+    elif isinstance(user_inputs, np.ndarray):
+        if user_inputs.ndim == 1:
+            inputs = [user_inputs[:, np.newaxis]]
+        elif user_inputs.ndim == 2:
+            inputs = [user_inputs]
+        else:
+            inputs = user_inputs
+
+    elif isinstance(user_inputs, list):
+        if len(user_inputs) == 0:
+            raise ValueError("Empty list passed.")
+        elif isinstance(user_inputs[0], str):
+            inputs = []
+            for inp in user_inputs:
+                if path.isdir(inp):
+                    inputs += list_dir(inp, keep_ext=[".npy", ".mat", ".txt"])
+                else:
+                    inputs.append(inp)
+        else:
+            inputs = user_inputs
+
+    else:
+        raise ValueError("inputs must be str, np.ndarray or list.")
+
+    if len(inputs) == 0:
+        raise ValueError("No valid inputs were passed.")
+
+    return inputs
 
 
 def load_data(

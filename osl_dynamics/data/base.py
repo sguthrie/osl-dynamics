@@ -1,118 +1,93 @@
 """Base class for handling data.
 
 """
+import pathlib
+import pickle
+import warnings
+from typing import List, Union, Optional, Dict
+from os import path
 
 import numpy as np
-import yaml
 
-from osl_dynamics.data.rw import RW
-from osl_dynamics.data.processing import Processing
-from osl_dynamics.data.tf import TensorFlowDataset
-from osl_dynamics.utils import misc
+from osl_dynamics.data import rw, data
 
 
-class Data(RW, Processing, TensorFlowDataset):
-    """Data Class.
+class DataCollection:
+    """Data Collection Class.
 
-    The Data class enables the input and processing of data. When given a list of
-    files, it produces a set of numpy memory maps which contain their raw data.
-    It also provides methods for batching data and creating TensorFlow Datasets.
+    The Data Collection class represents a set of data.
 
-    Parameters
-    ----------
-    inputs : list of str or str
-        Filenames to be read.
-    matlab_field : str
-        If a MATLAB filename is passed, this is the field that corresponds to the data.
-        By default we read the field 'X'.
-    sampling_frequency : float
-        Sampling frequency of the data in Hz.
-    store_dir : str
-        Directory to save results and intermediate steps to. Default is /tmp.
-    n_embeddings : int
-        Number of embeddings. Can be passed if data has already been prepared.
-    time_axis_first : bool
-        Is the input data of shape (n_samples, n_channels)?
-    load_memmaps: bool
-        Should we load the data into the memmaps?
-    keep_memmaps_on_close : bool
-        Should we keep the memmaps?
+    All Data Collections have a raw_data_obj, which is the representation of the raw data.
+    If the data have been processed, the Data Collection will also have a processed_data_obj, which is
+      the representation of the processed data.
     """
-
     def __init__(
         self,
-        inputs,
-        matlab_field="X",
-        sampling_frequency=None,
-        store_dir="tmp",
-        n_embeddings=None,
-        time_axis_first=True,
-        load_memmaps=True,
-        keep_memmaps_on_close=False,
+        inputs: Union[str, np.ndarray, List[str]],
+        matlab_field: str = "X",
+        time_axis_first: bool = True,
+        sampling_frequency: Optional[float] = None,
+        store_dir: str = 'tmp',
+        load_memmaps: bool = True,
+        keep_memmaps_on_close: bool = False,
     ):
-        # Unique identifier for the Data object
+        """
+        Parameters
+        ----------
+            inputs : list of str or str
+                Filenames to be read. Must include raw data, may include processed data
+            matlab_field : str
+                If a MATLAB filename is passed, this is the field that corresponds to the data.
+                By default, we read the field 'X'.
+            time_axis_first : bool
+                Is the input data of shape (n_samples, n_channels)? By default, yes
+            sampling_frequency : float or None
+                Sampling frequency of the data in Hz. Default is None
+            store_dir : str
+                Directory to save results and intermediate steps to. Default is /tmp.
+            load_memmaps: bool
+                Should we load the data into the memmaps? Default, yes.
+            keep_memmaps_on_close : bool
+                Should we keep the memmaps? Default, no.
+            """
         self._identifier = id(self)
 
-        # Load data by initialising an RW object
-        RW.__init__(
-            self,
-            inputs,
+        self.keep_memmaps_on_close = keep_memmaps_on_close
+        self.load_memmaps = load_memmaps
+
+        self.inputs = rw.parse_and_validate_inputs(inputs)
+
+        # Directory to store memory maps created by this class
+        self.store_dir_pathname = store_dir
+        self.store_dir = pathlib.Path(store_dir)
+        self.store_dir.mkdir(parents=True, exist_ok=True)
+
+        self.raw_data_obj = data.RawData(
+            self._identifier,
+            self.get_raw_data_inputs(),
             matlab_field,
-            sampling_frequency,
-            store_dir,
             time_axis_first,
-            load_memmaps=load_memmaps,
-            keep_memmaps_on_close=keep_memmaps_on_close,
-        )
-        if hasattr(self, "n_embeddings"):
-            n_embeddings = self.n_embeddings
-
-        # Initialise a Processing object so we have method we can use to prepare
-        # the data
-        Processing.__init__(
-            self, n_embeddings, keep_memmaps_on_close=keep_memmaps_on_close
+            sampling_frequency,
+            self.store_dir_pathname,
+            self.load_memmaps,
+            self.keep_memmaps_on_close,
         )
 
-        # Initialise a TensorFlowDataset object so we have methods to create datasets
-        TensorFlowDataset.__init__(self)
+        data_processing_kwargs = self.get_data_processing_kwargs_from_inputs(inputs)
+        if data_processing_kwargs:
+            processing_data_cls = self.get_processing_data_cls_from_kwargs(**data_processing_kwargs)
+            self.processed_data_obj = processing_data_cls(
+                self._identifier,
+                self.raw_data_obj,
+                self.store_dir_pathname,
+                self.load_memmaps,
+                self.keep_memmaps_on_close,
+                **data_processing_kwargs
+            )
+        else:
+            self.processed_data_obj = None
 
-    def __iter__(self):
-        return iter(self.subjects)
-
-    def __getitem__(self, item):
-        return self.subjects[item]
-
-    def __str__(self):
-        info = [
-            f"{self.__class__.__name__}",
-            f"id: {self._identifier}",
-            f"n_subjects: {self.n_subjects}",
-            f"n_samples: {self.n_samples}",
-            f"n_channels: {self.n_channels}",
-        ]
-        return "\n ".join(info)
-
-    @property
-    def raw_data(self):
-        """Return raw data as a list of arrays."""
-        return self.raw_data_memmaps
-
-    @property
-    def n_channels(self):
-        """Number of channels in the data files."""
-        return self.subjects[0].shape[-1]
-
-    @property
-    def n_samples(self):
-        """Number of samples for each subject."""
-        return sum([subject.shape[-2] for subject in self.subjects])
-
-    @property
-    def n_subjects(self):
-        """Number of subjects."""
-        return len(self.subjects)
-
-    def set_sampling_frequency(self, sampling_frequency):
+    def set_sampling_frequency(self, sampling_frequency: float):
         """Sets the sampling_frequency attribute.
 
         Parameters
@@ -120,50 +95,73 @@ class Data(RW, Processing, TensorFlowDataset):
         sampling_frequency : float
             Sampling frequency in Hz.
         """
-        self.sampling_frequency = sampling_frequency
+        self.raw_data_obj.set_sampling_frequency(sampling_frequency)
 
-    def time_series(self, concatenate=False):
-        """Time series data for all subjects.
+    @property
+    def processed(self):
+        if self.processed_data_obj:
+            return True
+        return False
 
+    @property
+    def raw_data(self) -> np.ndarray:
+        """Return raw data as a list of arrays."""
+        return self.raw_data_obj.raw_data_memmaps
+
+    def __str__(self):
+        info = [
+            f"{self.__class__.__name__}",
+            f"id: {self._identifier}",
+            f"n_subjects: {self.raw_data_obj.n_subjects}",
+            f"n_samples: {self.raw_data_obj.n_samples}",
+            f"n_channels: {self.raw_data_obj.n_channels}",
+        ]
+        return "\n ".join(info)
+
+    def get_raw_data_inputs(self):
+        return self.inputs
+
+    @staticmethod
+    def get_data_processing_kwargs_from_inputs(
+            inputs: Union[str, np.ndarray, List[str]]
+    ) -> Optional[Dict[str, Union[int, bool]]]:
+        """ If data has been prepared, returns the preparation the pickle file containing preparation settings.
         Parameters
         ----------
-        concatenate : bool
-            Should we return the time series for each subject concatenated?
+        inputs :
+            If data has previously been processed,
+                Path to directory containing the pickle file with preparation settings.
+            Otherwise, inputs to DataCollection
 
-        Returns
-        -------
-        ts : list or np.ndarray
-            Time series data for each subject.
+        :returns
+            None if data has not been prepared
+            Dict[str, Union[int, bool]]
         """
-        if concatenate or self.n_subjects == 1:
-            return np.concatenate(self.subjects)
-        else:
-            return self.subjects
+        if not isinstance(inputs, str):
+            return None
+        if path.isdir(inputs):
+            for file in rw.list_dir(inputs):
+                if "preparation.pkl" in file:
+                    return pickle.load(open(inputs + "/preparation.pkl", "rb"))
+        return None
 
-    @classmethod
-    def from_yaml(cls, file, **kwargs):
-        instance = misc.class_from_yaml(cls, file, kwargs)
+    @staticmethod
+    def get_processing_data_cls_from_kwargs(**processing_kwargs):
+        if 'amplitude_envelope' in processing_kwargs:
+            return data.AmplitudeEnvelopeProcessedData
+        return data.TdeProcessedData
 
-        with open(file) as f:
-            settings = yaml.load(f, Loader=yaml.Loader)
-
-        if issubclass(cls, Data):
-            try:
-                cls._process_from_yaml(instance, file, **kwargs)
-            except AttributeError:
-                pass
-
-        training_dataset = instance.training_dataset(
-            sequence_length=settings["sequence_length"],
-            batch_size=settings["batch_size"],
+    def process_raw_data(self, **kwargs):
+        if self.processed:
+            warnings.warn(
+                "Previously processed data will be overwritten.", RuntimeWarning
+            )
+        processing_data_cls = self.get_processing_data_cls_from_kwargs(**kwargs)
+        self.processed_data_obj = processing_data_cls(
+            self._identifier,
+            self.raw_data_obj,
+            self.store_dir_pathname,
+            self.load_memmaps,
+            self.keep_memmaps_on_close,
+            **kwargs
         )
-        prediction_dataset = instance.prediction_dataset(
-            sequence_length=settings["sequence_length"],
-            batch_size=settings["batch_size"],
-        )
-
-        return {
-            "data": instance,
-            "training_dataset": training_dataset,
-            "prediction_dataset": prediction_dataset,
-        }
